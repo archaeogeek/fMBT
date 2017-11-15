@@ -112,10 +112,13 @@ def cmd2py(cmdline):
         funccall = "pipe(%s, %s)" % (repr(cmd2py(cmd_left)),
                                      repr(cmd2py(cmd_right)))
     elif ">" in cmdline:
-        cmd_left, filename = cmdline.split(">", 1)
+        cmd_left, cmd_right = cmdline.split(">", 1)
+        filenames = shlex.split(cmd_right)
+        if len(filenames) != 1:
+            raise ValueError('right side of > must have single filename')
         funccall = "pipe(%s, %s)" % (
             repr(cmd2py(cmd_left)),
-            repr("redir('%s')" % (filename.strip(),)))
+            repr("redir(%r)" % (filenames[0],)))
     else:
         cmdline_list = shlex.split(cmdline.strip())
         funcname = cmdline_list[0]
@@ -188,7 +191,10 @@ def awk(prog, *args):
 def cd(dirname):
     """cd DIRNAME
     change current working directory"""
-    os.chdir(os.path.join(os.getcwd(), dirname))
+    d = expand(dirname, accept_pipe=False, min=1, exist=True).splitlines()
+    if len(d) > 1:
+        raise ValueError("ambiguous directory name")
+    os.chdir(os.path.join(os.getcwd(), d[0]))
     return ""
 
 def curl(*args):
@@ -218,36 +224,72 @@ def curl(*args):
     return "".join(rv)
 
 def find(*args):
-    """find [-n FILE] DIR
-    find file(s) in directory"""
-    opts, remainder = _getopts(args, "n:")
-    if not remainder:
+    """find [-n NAME][-i][-t T][-p a] DIR...
+    find under DIR(s), see help(find)"""
+    # -n NAME: search entries matching wildcard pattern NAME
+    # -i: ignore case
+    # -t f: (type=file) match only files
+    # -t d: (type=dir) match only directories
+    # -p a: print absolute paths
+    opts, remainder = _getopts(args, "n:t:ip:")
+    dirnames = expand(*remainder, exist=True, accept_pipe=False).splitlines()
+    if not dirnames:
         raise ValueError("missing DIR")
-    dirname = remainder[0]
     if "-n" in opts:
         findname = opts["-n"]
     else:
         findname = "*"
-    dirname_ends_with_sep = dirname[-1] in ["/", "\\"]
-    slash_only = not "\\" in dirname
-    if slash_only:
-        sep = "/"
+    if "-p" in opts:
+        if opts["-p"] == "a":
+            print_absolute_names = True
+        else:
+            raise ValueError("invalid print option -p %r, supported: 'a'" %
+                             (opts["-p"],))
     else:
-        sep = os.path.sep
+        print_absolute_names = False
+    if "-i" in opts:
+        ignore_case = True
+    else:
+        ignore_case = False
+    if "-t" in opts:
+        findtype = opts["-t"].lower()
+        if findtype not in ["f", "d"]:
+            raise ValueError("find type must be 'f' (file) or 'd' (directory)")
+    else:
+        findtype = None
     rv = []
-    # DIR + NAME forms a path without duplicate path separators
-    for root, dirs, files in os.walk(dirname):
+    for dirname in dirnames:
+        dirname_ends_with_sep = dirname[-1] in ["/", "\\"]
+        slash_only = not "\\" in dirname
         if slash_only:
-            root = root.replace("\\", "/")
-        for name in dirs + files:
-            if fnmatch.fnmatch(name, findname):
-                if root == dirname:
-                    if dirname_ends_with_sep:
-                        rv.append(name)
+            sep = "/"
+        else:
+            sep = os.path.sep
+        # DIR + NAME forms a path without duplicate path separators:
+        # if (and only if) DIR ends with /, then NAME does not start with /
+        for root, dirs, files in os.walk(dirname):
+            if slash_only:
+                root = root.replace("\\", "/")
+            if findtype:
+                dirs_set = set(dirs)
+                files_set = set(files)
+            for name in dirs + files:
+                if ((ignore_case == False and fnmatch.fnmatch(name, findname)) or
+                     (ignore_case == True and fnmatch.fnmatch(name.lower(), findname.lower()))):
+                    if (findtype == "f" and name not in files_set):
+                        continue # skip not-a-file from find -t f ...
+                    elif (findtype == "d" and name not in dirs_set):
+                        continue # skip not-a-dir from find -t d ...
+                    if print_absolute_names:
+                        rv.append(os.path.abspath(root + sep + name).replace('\\','/'))
                     else:
-                        rv.append(sep + name)
-                else:
-                    rv.append(root[len(dirname):] + sep + name)
+                        if root == dirname:
+                            if dirname_ends_with_sep:
+                                rv.append(name)
+                            else:
+                                rv.append(sep + name)
+                        else:
+                            rv.append(root[len(dirname):] + sep + name)
     return "\n".join(rv)
 
 def date():
@@ -340,15 +382,28 @@ def export(assignment):
     _g_pyenv.__setitem__(*assignment.split("=", 1))
     return ""
 
-def grep(pattern, *filenames):
-    """grep PATTERN [FILE...]
+def grep(*args):
+    """grep [-i] PATTERN [FILE...]
     show matching lines in file(s)"""
+    opts, pattern_filenames = _getopts(args, "i")
+    ignore_case = "-i" in opts
+    try:
+        pattern = pattern_filenames[0]
+        filenames = pattern_filenames[1:]
+    except:
+        raise ValueError("grep pattern missing")
+    if ignore_case:
+        pattern = pattern.lower()
     matching_lines = []
     all_files = expand(*filenames).splitlines()
+    prefix = ""
     for filename in all_files:
+        if len(all_files) > 1:
+            prefix = filename.replace("\\", "/") + ": "
         for line in file(filename).xreadlines():
-            if pattern in line:
-                matching_lines.append(line)
+            if ((not ignore_case and pattern in line) or
+                (ignore_case and pattern in line.lower())):
+                matching_lines.append(prefix + line)
     return "".join(matching_lines)
 
 def head(*args):
@@ -400,24 +455,39 @@ def kill(*pids):
     return ""
 
 def ls(*args):
-    """ls [-l]
+    """ls [-ld]
     list files on current working directory"""
-    opts, filenames = _getopts(args, "l")
+    opts, filenames = _getopts(args, "ld")
+    files = []
     if filenames:
-        files = sorted([f for f in expand(*filenames, exist=True).splitlines()])
+        for filename in expand(*filenames, exist=True).splitlines():
+            if os.path.isdir(filename) and not "-d" in opts:
+                root, subdirs, subfiles = os.walk(filename).next()
+                root = root.replace('\\', '/')
+                files.extend(sorted([root + "/" + d + "/" for d in subdirs]) +
+                             sorted([root + "/" + f for f in subfiles]))
+            else:
+                files.append(filename)
     else:
         _, subdirs, files = os.walk(".").next()
         files = sorted([d + "/" for d in subdirs]) + sorted(files)
+    files_outnames = []
+    for f in files:
+        if f.endswith("/"):
+            outname = os.path.basename(f[:-1]) + "/"
+        else:
+            outname = os.path.basename(f)
+        files_outnames.append((f, outname))
     if "-l" in opts:
         rv = []
-        for f in files:
+        for f, o in files_outnames:
             fstat = os.stat(f)
             rv.append("%10s  %s  %s" % (
                 fstat.st_size,
                 time.strftime("%Y-%m-%d %H:%M", time.localtime(fstat.st_mtime)),
-                f))
+                o))
     else:
-        rv = files
+        rv = [o for f, o in files_outnames]
     return "\n".join(rv)
 
 def nl(*filenames):
@@ -454,7 +524,7 @@ def redir(dst_filename):
 def rm(*args):
     """rm [-r] FILE...
     remove file"""
-    args, filenames = _getopts(args, "-r")
+    args, filenames = _getopts(args, "rf")
     filenames = expand(*filenames, accept_pipe=False, min=1).splitlines()
     for filename in filenames:
         if "-r" in args and os.path.isdir(filename):
@@ -472,7 +542,7 @@ def rmdir(dirname):
 def cat(*filenames):
     """cat FILE...
     concatenate contents of listed files"""
-    return "".join([file(f).read() for f in expand(*filenames).splitlines()])
+    return "".join([_file(f).read() for f in expand(*filenames).splitlines()])
 
 def df(*args):
     """df [-h] DIRNAME
@@ -592,34 +662,91 @@ def psh(*cmd):
     return o + e
 
 _g_pspycosh_conn = None
-def pspycosh(psconn):
-    """pspycosh HOSTSPEC
-    open pycosh shell on a pythonshare server"""
+def pspycosh(psconn, *cmdlines):
+    """pspycosh CONNSPEC [CMD...]
+    open remote pycosh shell or run CMDs on it"""
     global _g_pspycosh_conn
     if isinstance(psconn, pythonshare.client.Connection):
         _g_pspycosh_conn = psconn
+        close_connection = False
     else:
         _g_pspycosh_conn = pythonshare.connect(psconn)
+        close_connection = True
     _g_pspycosh_conn.exec_(_g_pycosh_source)
+    if cmdlines:
+        rv = []
+        try:
+            for cmdline in cmdlines:
+                rv.append(pycosh_eval(cmdline))
+        finally:
+            if close_connection:
+                _g_pspycosh_conn.close()
+                _g_pspycosh_conn = None
+        return "".join(rv)
     return ""
 
+def _psput_file(conn, src_filename, dst_filename):
+    data = file(src_filename, "rb").read()
+    conn.eval_('file(%s, "wb").write(base64.b64decode(%s))' %
+               (repr(dst_filename),
+                repr(base64.b64encode(data))))
+
+def _psput_dir(conn, dirname, dest_dir):
+    rv = []
+    dirname = dirname.replace("\\", "/")
+    dir_dest_dir = dest_dir.replace("\\", "/") + "/" + os.path.basename(dirname)
+    for root, dirs, files in os.walk(dirname):
+        file_src_dir = root.replace('\\', '/')
+        if file_src_dir[len(dirname):]:
+            file_dest_dir = (dir_dest_dir + "/" + file_src_dir[len(dirname):])
+        else:
+            file_dest_dir = dir_dest_dir
+        try:
+            conn.eval_('os.makedirs(%r)' % (file_dest_dir,))
+        except:
+            pass
+        for f in files:
+            _psput_file(conn,
+                        file_src_dir + "/" + f,
+                        file_dest_dir + "/" + f)
+            rv.append(file_src_dir + "/" + f)
+    return rv
+
 def psput(psconn, pattern):
-    """psput CONNSPEC FILE...
+    """psput CONNSPEC[//DEST] FILE...
     upload files to pythonshare server"""
+    # Examples:
+    # Put files to current working directory on host:
+    #     psput passwd@host:port files
+    # Put localdir under cwd/relative/path on host:
+    #     psput passwd@host:port//relative/path localdir
+    # Put localdir under /abs/path on host on Linux host:
+    #     psput passwd@host:port///abs/path localdir
+    # Put localdir under c:/abs/winpath on Windows host:
+    #     psput passwd@host:port//c:/abs/winpath localdir
+    # Put localdir to /abs/path on Linux host via hub/namespace:
+    #     psput passwd@hub:port/namespace///abs/path localdir
+    # Check cwd on host:
+    #     pspycosh passwd@host:port pwd
     if isinstance(psconn, pythonshare.client.Connection):
+        dest_dir = "."
         conn = psconn
         close_connection = False
     else:
+        if "//" in psconn:
+            psconn, dest_dir = psconn.split("//", 1)
+        else:
+            dest_dir = "."
         conn = pythonshare.connect(psconn)
         close_connection = True
-    conn.exec_("import base64")
+    conn.exec_("import base64, os")
     rv = []
     for filename in expand(pattern, accept_pipe=False).splitlines():
-        data = file(filename).read()
-        conn.eval_('file(%s, "wb").write(base64.b64decode(%s))' %
-                   (repr(os.path.basename(filename)),
-                    repr(base64.b64encode(data))))
-        rv.append(filename)
+        if os.path.isdir(filename):
+            rv.extend(_psput_dir(conn, filename, dest_dir))
+        else:
+            _psput_file(conn, filename, dest_dir + "/" + os.path.basename(filename))
+            rv.append(filename)
     if close_connection:
         conn.close()
     return "\n".join(rv)
@@ -638,15 +765,19 @@ def psget(psconn, pattern):
     rv = []
     for filename in conn.eval_('expand(%s, accept_pipe=False)' %
                                repr(pattern)).splitlines():
-        file(os.path.basename(filename), "w").write(
-            conn.eval_("file(%s, 'rb').read()" % (repr(filename),)))
+        try:
+            data = conn.eval_("file(%r, 'rb').read()" % (filename,))
+        except:
+            rv.append("! error reading %r" % (filename,))
+            continue
+        file(os.path.basename(filename), "wb").write(data)
         rv.append(filename)
     return "\n".join(rv)
 
 def pwd():
     """pwd
     print current working directory"""
-    return os.getcwd()
+    return os.getcwd().replace("\\", "/")
 
 def pye(*code):
     """pye CODE
@@ -822,6 +953,34 @@ def unzip(*args):
             rv.extend(zf.namelist())
     return "\n".join(rv)
 
+def whoami():
+    """whoami
+    print user name"""
+    try:
+        return getpass.getuser()
+    except Exception:
+        return ""
+
+def xargs(*args):
+    """xargs CMD
+    run CMD with args from stdin"""
+    if not args:
+        raise ValueError("xargs: CMD missing")
+    if not _g_pipe_has_data:
+        raise ValueError("xargs: no get arguments in pipe")
+    retval = []
+    for arg in open(_g_pipe_filename):
+        arg = arg.strip()
+        funccall = args[0] + repr(tuple(args[1:]) + (arg,))
+        try:
+            func_rv = eval(funccall)
+            if func_rv and not func_rv.endswith("\n"):
+                func_rv += "\n"
+            retval.append(func_rv)
+        except Exception, e:
+            retval.append(str(e).splitlines()[-1] + "\n")
+    return "".join(retval)
+
 def xxd(*args):
     """xxd [FILE...]
     make a hexdump"""
@@ -907,8 +1066,14 @@ def _main():
             retval = pycosh_eval(cmdline)
         _output(str(retval))
 
-if "__file__" in globals() and __file__.endswith("pycosh.py"):
-    _g_pycosh_source = open(__file__, "r").read()
+if "__file__" in globals() and "pycosh.py" in __file__:
+    if __file__.endswith("pycosh.py"):
+        _g_pycosh_source = open(__file__, "r").read()
+    elif __file__.endswith("pycosh.pyc"):
+        try:
+            _g_pycosh_source = open(__file__[:-1], "r").read()
+        except:
+            pass
 
 if "_g_pycosh_source" in globals():
     _g_pycosh_source = "_g_pycosh_source = %s\n%s" % (repr(_g_pycosh_source), _g_pycosh_source)
